@@ -1,17 +1,17 @@
 // src/app/csv-mapper/csv-mapper.component.ts
 import { Component, OnInit, ChangeDetectorRef, OnDestroy } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
-import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import { environment } from '../../environments/environment';
-
+import { LoaderService } from './loader.service';
 const STANDARD_COLUMNS: string[] = ['Line Item ID', 'Tag Number', 'Short Description', 'Quantity', 'Unit', 'Commodity Code', 'Size1', 'Specification Code'];
 
-// Predefined example values for potential SMAT columns.
-const smat_columns_values: Record<string, string[]> = {
-    // Example:
-    // "Status": ["Open", "Closed", "Pending"],
-    // "Priority": ["High", "Medium", "Low"]
-};
+// // Predefined example values for potential SMAT columns.
+// const smat_columns_values: Record<string, string[]> = {
+//     // Example:
+//     // "Status": ["Open", "Closed", "Pending"],
+//     // "Priority": ["High", "Medium", "Low"]
+// };
 
 interface MappingTableRow {
     sourceHeader: string;
@@ -29,7 +29,7 @@ interface MappingTableRow {
   styleUrls: ['./csv-mapper.component.css']
 })
 export class CsvMapperComponent implements OnInit, OnDestroy {
-  private odataUrl = 'https://684c168eed2578be881d9c58.mockapi.io/api/v1/LineItemProperties';
+  private odataUrl =    "http://localhost:810/api/v2/SDA/Objects('0197A2700DE949A1858A4E3AEECB5459')/Exposes_12?$select=DisplayName";
   sourceCsvHeaders: string[] = [];
   sourceCsvSampleData: string[][] = []; // Only first 10 rows of actual data
   targetSchemaColumns: string[] = [];
@@ -60,7 +60,8 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
 
   private genAI: GoogleGenAI | null = null;
 
-  constructor(private cdr: ChangeDetectorRef, private http: HttpClient) {
+  constructor(private cdr: ChangeDetectorRef, private http: HttpClient, private loaderService: LoaderService) {
+    
     if (!environment.apiKey) {
       console.error("API_KEY environment variable not set for Gemini API.");
       this.updateStatus('Configuration error: API Key is missing. Cannot contact AI service.', true);
@@ -68,6 +69,7 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
       this.genAI = new GoogleGenAI({apiKey: environment.apiKey});
       
     }
+  
   }
 
   ngOnInit(): void {
@@ -157,9 +159,12 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
   async fetchTargetSchemaFromOData(): Promise<void> {
     this.updateStatus('Fetching target schema from OData...', false);
     try {
-      const response = await this.http.get<Array<{ DisplayName: string }>>(this.odataUrl).toPromise();
-      if (response && Array.isArray(response)) {
-        this.targetSchemaColumns = response.map(item => item.DisplayName).filter(name => name);
+      // const response2 = await this.http.get<Array<{ DisplayName: string }>>(this.odataUrl ).toPromise();
+      // console.log("OData Response:", response2);
+   
+      const response: any = await this.http.get<Array<{ DisplayName: string }>>(this.odataUrl).toPromise();
+      if (response && response.value && Array.isArray(response.value)) {
+        this.targetSchemaColumns = response.value.map(item => item.DisplayName).filter(name => name);
         if (this.targetSchemaColumns.length > 0) {
           this.isTargetSchemaProvided = true;
           this.updateStatus(`Target schema loaded from OData: ${this.targetSchemaColumns.length} columns.`, false);
@@ -650,13 +655,13 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
     this.updateStatus('Triplet Loss CSV downloaded.', false);
   }
 
-  handleDownloadMappedDataCsv(): void {
+ handleDownloadMappedDataCsv(): void {
     if (!this.isSourceUploaded || this.sourceCsvSampleData.length === 0) {
       this.updateStatus('Source CSV not uploaded or no sample data available.', true);
       return;
     }
 
-    const currentMappings = this.getSelectedTargetMappings(); // Existing: SourceHeader -> TargetHeader
+   this.getSelectedTargetMappings(); // Existing: SourceHeader -> TargetHeader
     const mappedTargetToSource: Record<string, string> = {}; // TargetHeader -> SourceHeader
     const allUserMappedTargetHeaders: string[] = []; // All target headers the user actually mapped
 
@@ -665,26 +670,21 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
         if (!allUserMappedTargetHeaders.includes(row.selectedTarget)) {
           allUserMappedTargetHeaders.push(row.selectedTarget);
         }
-        // If multiple source headers map to the same target, this will take the last one.
-        // This is okay for now as duplicates are flagged elsewhere.
         mappedTargetToSource[row.selectedTarget] = row.sourceHeader;
       }
     });
 
     if (allUserMappedTargetHeaders.length === 0) {
-      this.updateStatus('No valid column mappings found. Please map columns before downloading.', false);
+      this.updateStatus('No valid column mappings found. Please map columns before uploading.', false);
       return;
     }
 
-    // Initialize CSV data arrays
     const standardCsvData: string[][] = [];
     const invertedCsvData: string[][] = [];
 
-    // Add header rows
-    standardCsvData.push([...STANDARD_COLUMNS]); // Ensure it's a copy
+    standardCsvData.push([...STANDARD_COLUMNS]);
     invertedCsvData.push(['Line Item ID', 'Property_Name', 'Property_Value', 'Property_Value_UoM']);
 
-    // Identify 'Line Item ID' Source Header
     let lineItemIdSourceHeader: string | undefined = undefined;
     const lineItemIdMapping = this.mappingTableRows.find(row => row.selectedTarget === 'Line Item ID');
     if (lineItemIdMapping && lineItemIdMapping.sourceHeader) {
@@ -693,11 +693,9 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
       console.warn("Line Item ID is not mapped. It will be blank in the inverted CSV.");
     }
 
-    // Determine final headers for standard CSV and non-standard headers for inverted CSV
     const finalStandardHeaders = STANDARD_COLUMNS.filter(sc => allUserMappedTargetHeaders.includes(sc));
     const nonStandardTargetHeaders = allUserMappedTargetHeaders.filter(h => !STANDARD_COLUMNS.includes(h));
 
-    // Process Data Rows
     this.sourceCsvSampleData.forEach(sourceRow => {
       let lineItemIdValue: string = "";
       if (lineItemIdSourceHeader) {
@@ -707,9 +705,8 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
         }
       }
 
-      // For Standard CSV
       const outputStandardRow: string[] = [];
-      STANDARD_COLUMNS.forEach(stdHeader => { // Iterate in the order of STANDARD_COLUMNS
+      STANDARD_COLUMNS.forEach(stdHeader => {
         if (finalStandardHeaders.includes(stdHeader)) {
           const originalSourceHeader = mappedTargetToSource[stdHeader];
           if (originalSourceHeader) {
@@ -717,64 +714,77 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
             if (sourceHeaderIndex !== -1 && sourceRow[sourceHeaderIndex] !== undefined) {
               outputStandardRow.push(this.escapeCsvCell(sourceRow[sourceHeaderIndex]));
             } else {
-              outputStandardRow.push(""); // Source header for this standard column not found in source CSV or value missing
+              outputStandardRow.push("");
             }
           } else {
-             outputStandardRow.push(""); // Standard column was not mapped by user
+            outputStandardRow.push("");
           }
         } else {
-          outputStandardRow.push(""); // This standard column is not in finalStandardHeaders (i.e., not mapped)
+          outputStandardRow.push("");
         }
       });
       standardCsvData.push(outputStandardRow);
 
-      // For Inverted CSV
       nonStandardTargetHeaders.forEach(nonStdHeader => {
         const originalSourceHeader = mappedTargetToSource[nonStdHeader];
         if (originalSourceHeader) {
           const sourceHeaderIndex = this.sourceCsvHeaders.indexOf(originalSourceHeader);
           if (sourceHeaderIndex !== -1 && sourceRow[sourceHeaderIndex] !== undefined) {
             const propertyValue = this.escapeCsvCell(sourceRow[sourceHeaderIndex]);
-            if (propertyValue !== "") { // Only add row if there's a value
-              invertedCsvData.push([lineItemIdValue, this.escapeCsvCell(nonStdHeader), propertyValue, ""]); // UoM is blank
+            if (propertyValue !== "") {
+              invertedCsvData.push([lineItemIdValue, this.escapeCsvCell(nonStdHeader), propertyValue, ""]);
             }
           }
         }
       });
     });
 
-    let standardDownloaded = false;
-    let invertedDownloaded = false;
+  let standardUploaded = false;
+    let invertedUploaded = false;
     let statusMessages: string[] = [];
 
+    const uploadFile = (fileData: string[][], filename: string) => {
+      const csvContent = fileData.map(row => row.join(',')).join('\r\n');
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const file = new File([blob], filename, { type: 'text/csv;charset=utf-8;' });
+      this.updateStatus(`Uploading ${filename}...`, false);
+      this.loaderService.runFullWorkflow(file).subscribe({
+        next: () => {
+          statusMessages.push(`${filename} uploaded successfully.`);
+          if (filename === "standard_mapped_data.csv") standardUploaded = true;
+          if (filename === "inverted_mapped_data.csv") invertedUploaded = true;
+          this.updateStatus(statusMessages.join(' '), false);
+        },
+        error: (err) => {
+          console.error(`Error uploading ${filename}:`, err);
+          statusMessages.push(`Error uploading ${filename}. Check console.`);
+          this.updateStatus(statusMessages.join(' '), true);
+          
+        }
+      });
+    };
+console.log(standardUploaded, invertedUploaded);
     if (standardCsvData.length > 1) {
-      this.downloadCsv(standardCsvData, "standard_mapped_data.csv");
-      standardDownloaded = true;
+      uploadFile(standardCsvData, "standard_mapped_data.csv");
+    } else {
+      statusMessages.push("Standard CSV had no data to upload.");
     }
 
     if (invertedCsvData.length > 1) {
-      this.downloadCsv(invertedCsvData, "inverted_mapped_data.csv");
-      invertedDownloaded = true;
-    }
-
-    if (standardDownloaded && invertedDownloaded) {
-      statusMessages.push("Standard and Inverted Mapped Data CSVs downloaded.");
-    } else if (standardDownloaded) {
-      statusMessages.push("Standard CSV downloaded.");
-      statusMessages.push("Inverted CSV had no data to download.");
-    } else if (invertedDownloaded) {
-      statusMessages.push("Inverted CSV downloaded.");
-      statusMessages.push("Standard CSV had no data to download.");
+      uploadFile(invertedCsvData, "inverted_mapped_data.csv");
     } else {
-      this.updateStatus('No data to download for Standard or Inverted CSVs based on current mappings.', false);
-      return;
+      statusMessages.push("Inverted CSV had no data to upload.");
     }
-
+    
     if (lineItemIdSourceHeader === undefined) {
         statusMessages.push("Note: 'Line Item ID' was not mapped; it will be blank in the Inverted CSV.");
     }
 
-    this.updateStatus(statusMessages.join(' '), false);
+    if (statusMessages.length > 0 && !(standardCsvData.length > 1 || invertedCsvData.length > 1)) {
+        this.updateStatus(statusMessages.join(' '), false);
+    } else if (!(standardCsvData.length > 1 || invertedCsvData.length > 1)) {
+        this.updateStatus('No data to upload for Standard or Inverted CSVs based on current mappings.', false);
+    }
   }
 
   private downloadCsv(data: string[][], filename: string): void {
