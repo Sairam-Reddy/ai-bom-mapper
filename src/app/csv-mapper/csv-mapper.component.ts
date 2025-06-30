@@ -1,9 +1,10 @@
 // src/app/csv-mapper/csv-mapper.component.ts
 import { Component, OnInit, ChangeDetectorRef, OnDestroy } from '@angular/core';
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpHeaders } from '@angular/common/http';
 import { GoogleGenAI } from "@google/genai";
 import { environment } from '../../environments/environment';
 import { LoaderService } from './loader.service';
+
 const STANDARD_COLUMNS: string[] = ['Line Item ID', 'Tag Number', 'Short Description', 'Quantity', 'Unit', 'Commodity Code', 'Size1', 'Specification Code'];
 
 // // Predefined example values for potential SMAT columns.
@@ -23,21 +24,34 @@ interface MappingTableRow {
     // aiSuggestedOptionValue?: string; // The value of the option that AI suggested (for persistent option highlight)
 }
 
+interface TargetSchemaColumn {
+  DisplayName: string;
+  Synonyms: string[] | null;
+  Antonyms: string[] | null;
+  UID: string;
+  OBID: string;
+}
+
 @Component({
   selector: 'app-csv-mapper',
   templateUrl: './csv-mapper.component.html',
   styleUrls: ['./csv-mapper.component.css']
 })
 export class CsvMapperComponent implements OnInit, OnDestroy {
-  private odataUrl =    "http://localhost:810/api/v2/SDA/Objects('0197A2700DE949A1858A4E3AEECB5459')/Exposes_12?$select=DisplayName";
+  readonly CREATE_NEW_PROPERTY_VALUE = "__CREATE_NEW_PROPERTY__";
+  bominterfaceId = '0197A2700DE949A1858A4E3AEECB5459';
+  private odataUrl = `http://localhost:810/api/v2/SDA/Objects('${this.bominterfaceId}')/Exposes_12?$select=DisplayName,Synonyms,Antonyms,UID,OBID`;
+  private readonly SDA_OBJECTS_BASE_URL = "http://localhost:810/api/v2/SDA/Objects"; // For PATCH
+  private createPropertyUrl = `http://localhost:810/api/v2/SDA/CreateBOMInvertedCSVMapping`;
   sourceCsvHeaders: string[] = [];
   sourceCsvSampleData: string[][] = []; // Only first 10 rows of actual data
-  targetSchemaColumns: string[] = [];
+  targetSchemaColumns: string[] = []; // This will store only DisplayNames for the dropdown
+  private targetSchemaData: TargetSchemaColumn[] = []; // To store full data including synonyms/antonyms
   tripletKnowledgeBase: Array<{ anchor: string, positive: string, negative: string }> = [];
 
   isSourceUploaded = false;
   isTargetSchemaProvided = false; // This will be set by OData fetch
-  isTripletKnowledgeBaseUploaded = false;
+  isTripletKnowledgeBaseUploaded = false; // Can be true either by OData or file upload
 
   readonly N_A_MAP_VALUE = "__N/A_MAPPING__";
 
@@ -48,8 +62,8 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
 
   // Button states & UI
   suggestMappingsButtonDisabled = true;
-  downloadTripletCsvButtonVisible = false;
-  downloadTripletCsvButtonDisabled = true;
+  // downloadTripletCsvButtonVisible = false; // Removed
+  // downloadTripletCsvButtonDisabled = true; // Removed
   downloadMappedDataButtonVisible = false;
   downloadMappedDataButtonDisabled = true;
   aiSuggestionControlsVisible = false;
@@ -57,6 +71,14 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
   isSuggesting = false;
   suggestButtonText = 'Suggest Mappings with AI';
   private suggestionTimeouts: any[] = []; // To clear timeouts on component destroy
+
+  // Create New Property Modal State
+  isCreatePropertyModalVisible: boolean = false;
+  newPropertyName: string = '';
+  currentMappingRowForCreate: MappingTableRow | null = null;
+  allowCreateNewProperty: boolean = false;
+  createPropertyError: string = '';
+
 
   private genAI: GoogleGenAI | null = null;
 
@@ -73,9 +95,27 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
   }
 
   ngOnInit(): void {
-    this.fetchTargetSchemaFromOData(); // Load target schema on init
-    this.checkIfReadyForMappingAndSuggestions();
-  }
+  this.http
+    .get("http://localhost:810/api/v2/SDA/Objects?$filter=UID eq 'IBOMLineItem' and class eq 'InterfaceDef'&$select=OBID")
+    .subscribe({
+      next: (response: any) => {
+        console.log("OBID Response:", response);
+        this.bominterfaceId = response.value?.[0]?.OBID || this.bominterfaceId;
+        // Update the odataUrl with the potentially new bominterfaceId
+        this.odataUrl = `http://localhost:810/api/v2/SDA/Objects('${this.bominterfaceId}')/Exposes_12?$select=DisplayName,Synonyms,Antonyms,UID,OBID`;
+        console.log("Fetched bominterfaceId:", this.bominterfaceId, "New OData URL for Exposes_12:", this.odataUrl);
+        this.fetchTargetSchemaFromOData(); // This will now also trigger triplet fetching
+        this.checkIfReadyForMappingAndSuggestions();
+      },
+      error: (err) => {
+        console.error("Error fetching OBID:", err);
+        this.updateStatus("Error fetching OBID. Check console for details.", true);
+        // Still attempt to load target schema with fallback/default OBID
+        // this.fetchTargetSchemaFromOData(); // This will now also trigger triplet fetching
+        // this.checkIfReadyForMappingAndSuggestions();
+      }
+    });
+}
 
   ngOnDestroy(): void {
     this.suggestionTimeouts.forEach(timeoutId => clearTimeout(timeoutId));
@@ -159,15 +199,22 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
   async fetchTargetSchemaFromOData(): Promise<void> {
     this.updateStatus('Fetching target schema from OData...', false);
     try {
-      // const response2 = await this.http.get<Array<{ DisplayName: string }>>(this.odataUrl ).toPromise();
-      // console.log("OData Response:", response2);
-   
-      const response: any = await this.http.get<Array<{ DisplayName: string }>>(this.odataUrl).toPromise();
+      const response: any = await this.http.get<Array<TargetSchemaColumn>>(this.odataUrl).toPromise();
       if (response && response.value && Array.isArray(response.value)) {
-        this.targetSchemaColumns = response.value.map(item => item.DisplayName).filter(name => name);
+        this.targetSchemaData = response.value.map((item: any) => ({
+          DisplayName: item.DisplayName,
+          Synonyms: item.Synonyms ? item.Synonyms.split(';').map((s: string) => s.trim()) : null,
+          Antonyms: item.Antonyms ? item.Antonyms.split(';').map((a: string) => a.trim()) : null,
+          UID: item.UID, // Make sure UID is present in the response and item
+          OBID: item.OBID // Make sure OBID is present
+        })).filter((item: TargetSchemaColumn) => item.DisplayName && item.UID && item.OBID); // Ensure OBID is also present
+
+        this.targetSchemaColumns = this.targetSchemaData.map(item => item.DisplayName);
+
         if (this.targetSchemaColumns.length > 0) {
           this.isTargetSchemaProvided = true;
           this.updateStatus(`Target schema loaded from OData: ${this.targetSchemaColumns.length} columns.`, false);
+          this.fetchTripletKnowledgeFromOData(); // Call to populate triplets
         } else {
           this.updateStatus('Target schema loaded from OData, but no display names found.', true);
           this.isTargetSchemaProvided = false;
@@ -184,15 +231,63 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
     this.checkIfReadyForMappingAndSuggestions(); // Update UI based on new state
   }
 
-  updateDownloadButtonsState(): void {
-    // Triplet Data Button
-    if (this.isSourceUploaded && this.isTargetSchemaProvided) {
-      this.downloadTripletCsvButtonVisible = true;
-      this.downloadTripletCsvButtonDisabled = false; // Enable if suggestions were made
-    } else {
-      this.downloadTripletCsvButtonVisible = false;
-      this.downloadTripletCsvButtonDisabled = true;
+  fetchTripletKnowledgeFromOData(): void {
+    if (!this.isTargetSchemaProvided || this.targetSchemaData.length === 0) {
+      return;
     }
+
+    const triplets: Array<{ anchor: string, positive: string, negative: string }> = [];
+    this.targetSchemaData.forEach(item => {
+      if (item.DisplayName) {
+        if (item.Synonyms && item.Synonyms.length > 0) {
+          item.Synonyms.forEach(synonym => {
+            if (synonym) { // Ensure synonym is not empty
+              triplets.push({ anchor: item.DisplayName, positive: synonym, negative: "" });
+            }
+          });
+        }
+        if (item.Antonyms && item.Antonyms.length > 0) {
+          item.Antonyms.forEach(antonym => {
+            if (antonym) { // Ensure antonym is not empty
+              // If synonyms also existed, we might create new entries or append to existing ones.
+              // For simplicity, creating new entries. Could be optimized.
+              triplets.push({ anchor: item.DisplayName, positive: "", negative: antonym });
+            }
+          });
+        }
+        // If only DisplayName exists, and no synonyms or antonyms, we don't add a triplet.
+        // Or, we could add { anchor: item.DisplayName, positive: item.DisplayName, negative: ""} if needed.
+        // Current user story implies synonyms/antonyms are the source for positive/negative.
+      }
+    });
+
+    if (triplets.length > 0) {
+      // If a CSV was uploaded, we might want to merge or prioritize.
+      // For now, OData triplets will overwrite if fetched after a CSV upload (which shouldn't happen with current flow)
+      // or append if this is called multiple times (which it shouldn't).
+      // Let's assume this is the primary source if no CSV is uploaded.
+      if (!this.isTripletKnowledgeBaseUploaded) { // Only set if not already set by CSV
+        this.tripletKnowledgeBase = triplets;
+        this.isTripletKnowledgeBaseUploaded = true;
+        this.updateStatus(`Triplet knowledge automatically derived from OData: ${this.tripletKnowledgeBase.length} relationships.`, false);
+      } else {
+        // Potentially merge or inform user about multiple sources.
+        // For now, if CSV was uploaded, we prefer that.
+        console.log("Triplet CSV already uploaded. OData triplets were fetched but not applied to avoid overwrite. Consider merging logic if needed.");
+      }
+    }
+    this.checkIfReadyForMappingAndSuggestions();
+  }
+
+  updateDownloadButtonsState(): void {
+    // Triplet Data Button - Removed
+    // if (this.isSourceUploaded && this.isTargetSchemaProvided) {
+    //   this.downloadTripletCsvButtonVisible = true;
+    //   this.downloadTripletCsvButtonDisabled = false; // Enable if suggestions were made
+    // } else {
+    //   this.downloadTripletCsvButtonVisible = false;
+    //   this.downloadTripletCsvButtonDisabled = true;
+    // }
 
     // Mapped Data Button
     let hasValidMapping = false;
@@ -215,11 +310,23 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
     if (this.isSourceUploaded && this.isTargetSchemaProvided) {
       this.aiSuggestionControlsVisible = true;
       this.suggestMappingsButtonDisabled = false;
-      let readyMessage = 'Source CSV loaded. Target Schema automatically loaded from OData.';
-      if (this.isTripletKnowledgeBaseUploaded) {
-        readyMessage += ' Triplet Knowledge CSV also loaded.';
-      }
+      let readyMessage = 'Source CSV loaded. Target Schema and Triplet Knowledge automatically loaded from OData.';
+      // if (this.isTripletKnowledgeBaseUploaded) { // This is now part of the above message or handled if CSV was uploaded first
+      //   readyMessage += ' Triplet Knowledge CSV also loaded.';
+      // }
       readyMessage += ' You can now manually map columns or use AI suggestions.';
+      // Check if triplet was loaded by CSV, if so, amend message.
+      // This check needs to be more robust if we allow OData triplets AND CSV triplets to merge.
+      // For now, if isTripletKnowledgeBaseUploaded is true, it could be from OData or CSV.
+      // The fetchTripletKnowledgeFromOData has logic to not overwrite CSV-loaded data.
+      // So the generic "Triplet knowledge available" is fine.
+      if (this.isTripletKnowledgeBaseUploaded && !this.tripletKnowledgeBase.some(t => t.anchor)) {
+          // This case implies isTripletKnowledgeBaseUploaded was true BUT OData didn't find any,
+          // and no CSV was uploaded. This state should ideally not happen with current logic.
+          // Or, if a CSV was uploaded but it was empty/invalid.
+      }
+
+
       this.updateStatus(readyMessage, false);
 
       if (this.sourceCsvHeaders.length > 0 && this.mappingTableRows.length === 0) { // Avoid re-creating table if already exists
@@ -377,13 +484,200 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
   }
 
   onMappingChange(changedRow: MappingTableRow): void {
-    changedRow.isAiSuggestedTemporarily = false; // User manually changed it
-    // changedRow.aiSuggestionType = null; // Keep type for persistent option highlight
-    // If a user selects the AI suggested option again, it should still be highlighted.
-    // If they select something else, the highlight for the OLD ai suggestion remains, but no new temp highlight.
+    const userSelectedTarget = changedRow.selectedTarget;
+    const aiSuggestedTarget = changedRow.aiSuggestedTargetValue; // What AI last suggested for this row
+    const sourceHeader = changedRow.sourceHeader;
+
+    // Priority 1: Handle "Create New Property" selection
+    if (userSelectedTarget === this.CREATE_NEW_PROPERTY_VALUE) {
+      this.currentMappingRowForCreate = changedRow;
+      this.newPropertyName = '';
+      this.createPropertyError = '';
+      this.isCreatePropertyModalVisible = true;
+      // Feedback for a newly created property will be handled when it's actually created and assigned.
+      // For now, we don't want to revert the dropdown immediately if _updatePropertyFeedback is async.
+      // The closeCreatePropertyModal(true) handles reverting if cancelled.
+      return;
+    }
+
+    // Apply new feedback logic
+    // Synonym Logic: If user selected a valid target AND it's different from the source header itself.
+    if (userSelectedTarget && userSelectedTarget !== this.N_A_MAP_VALUE && userSelectedTarget !== "") {
+      if (sourceHeader.toLowerCase() !== userSelectedTarget.toLowerCase()) {
+        this._updatePropertyFeedback(userSelectedTarget, sourceHeader, true);
+      }
+    }
+
+    // Antonym Logic: If AI had made a valid suggestion AND user changed it to something else (could be another property or N/A).
+    if (aiSuggestedTarget && aiSuggestedTarget !== this.N_A_MAP_VALUE && aiSuggestedTarget !== "") {
+      if (userSelectedTarget !== aiSuggestedTarget) {
+        this._updatePropertyFeedback(aiSuggestedTarget, sourceHeader, false);
+      }
+    }
+
+    // General UI updates after any mapping change
+    changedRow.isAiSuggestedTemporarily = false; // User manually interacted, remove temporary AI highlight
     this.checkAndHighlightDuplicateTargets();
     this.updateDownloadButtonsState();
+    // Note: aiSuggestedTargetValue remains on the row. If AI runs again, it will be overwritten.
+    // If user changes mapping multiple times without AI re-running, aiSuggestedTargetValue still refers to the *last AI suggestion*.
   }
+
+  onCreatePropertyNameChange(): void {
+    if (!this.newPropertyName.trim()) {
+      this.createPropertyError = 'Property name cannot be empty.';
+      return;
+    }
+    const isDuplicate = this.targetSchemaColumns.some(
+      col => col.toLowerCase() === this.newPropertyName.trim().toLowerCase()
+    );
+    if (isDuplicate) {
+      this.createPropertyError = `Property "${this.newPropertyName.trim()}" already exists.`;
+    } else {
+      this.createPropertyError = ''; // Clear error if valid
+    }
+  }
+
+
+  closeCreatePropertyModal(revertSelection: boolean = true): void {
+    this.isCreatePropertyModalVisible = false;
+    if (this.currentMappingRowForCreate && revertSelection) {
+      // Revert the selection in the dropdown if user cancelled
+      this.currentMappingRowForCreate.selectedTarget = ""; // Or a stored previous value
+      // Manually trigger change detection if needed, or ensure ngModelChange handles it
+      this.checkAndHighlightDuplicateTargets(); // Re-validate after reverting
+      this.updateDownloadButtonsState();
+    }
+    this.currentMappingRowForCreate = null;
+    this.newPropertyName = '';
+    this.createPropertyError = '';
+  }
+
+  async handleCreateProperty(): Promise<void> {
+    if (!this.newPropertyName || this.createPropertyError) {
+      // Should be disabled, but as a safeguard
+      this.createPropertyError = this.createPropertyError || 'Property name is invalid.';
+      return;
+    }
+
+    const propertyToCreate = this.newPropertyName.trim();
+
+    try {
+      this.updateStatus(`Creating new property "${propertyToCreate}"...`, false);
+      // Assuming API expects {"propertyDef": "name"}
+      await this.http.post(this.createPropertyUrl, { propertyDef: propertyToCreate }).toPromise();
+
+      this.updateStatus(`Successfully created property "${propertyToCreate}".`, false);
+
+      // Add to target schema lists
+      this.targetSchemaColumns.push(propertyToCreate);
+      this.targetSchemaData.push({
+        DisplayName: propertyToCreate,
+        Synonyms: null,
+        Antonyms: null,
+        UID: '', // Placeholder, backend creates actual UID.
+        OBID: '' // Placeholder, backend creates actual OBID. Cannot be used for PATCH.
+      });
+
+      if (this.currentMappingRowForCreate) {
+        this.currentMappingRowForCreate.selectedTarget = propertyToCreate;
+        // Highlight it as if AI suggested it or a different class? For now, just select.
+        this.currentMappingRowForCreate.isAiSuggestedTemporarily = false;
+      }
+
+      this.closeCreatePropertyModal(false); // Close modal, don't revert selection
+      this.checkAndHighlightDuplicateTargets();
+      this.updateDownloadButtonsState();
+      this.cdr.detectChanges();
+
+    } catch (error: any) {
+      console.error('Error creating new property:', error);
+      const errorMsg = error.error?.message || error.message || 'An unknown error occurred.';
+      this.createPropertyError = `Failed to create property: ${errorMsg}`;
+      this.updateStatus(`Error creating property "${propertyToCreate}". ${errorMsg}`, true);
+    }
+  }
+
+  private async _updatePropertyFeedback(propertyName: string, feedbackSourceHeader: string, isPositive: boolean): Promise<void> {
+    if (!propertyName || !feedbackSourceHeader) {
+      return; // Essential info missing
+    }
+
+    const targetSchemaEntry = this.targetSchemaData.find(entry => entry.DisplayName === propertyName);
+    if (!targetSchemaEntry || !targetSchemaEntry.OBID) {
+      console.warn(`Cannot update feedback for property "${propertyName}": OBID not found or missing. Feedback source: "${feedbackSourceHeader}"`);
+      this.updateStatus(`Cannot save feedback for "${propertyName}": essential identifier (OBID) is missing.`, true);
+      return;
+    }
+
+    const patchUrl = `${this.SDA_OBJECTS_BASE_URL}('${targetSchemaEntry.OBID}')`;
+    let currentSynonyms = '';
+    let currentAntonyms = '';
+
+    try {
+       const headers = new HttpHeaders({ 'Accept': 'application/vnd.intergraph.data+json' });
+       headers.set('X-Ingr-TenantId', '1');  
+    headers.set('X-Ingr-OrgId', '5377fd8c-2461-40fa-bda2-f733d6936019'); 
+     console.log('headers', headers);
+      // Ensure we have the correct headers for the request
+      // Fetch current Synonyms and Antonyms first
+      const currentObjectState: any = await this.http.get(`${patchUrl}?$select=Synonyms,Antonyms`, { headers:headers }).toPromise();
+      currentSynonyms = currentObjectState.Synonyms || '';
+      currentAntonyms = currentObjectState.Antonyms || '';
+
+      let synonymsArray = currentSynonyms ? currentSynonyms.split(';').map(s => s.trim()) : [];
+      let antonymsArray = currentAntonyms ? currentAntonyms.split(';').map(a => a.trim()) : [];
+      const feedbackLower = feedbackSourceHeader.toLowerCase();
+      let changed = false;
+      const payload: { Synonyms?: string, Antonyms?: string } = {};
+
+      if (isPositive) {
+        // Add to Synonyms, remove from Antonyms if present
+        if (antonymsArray.map(a => a.toLowerCase()).includes(feedbackLower)) {
+          antonymsArray = antonymsArray.filter(a => a.toLowerCase() !== feedbackLower);
+          payload.Antonyms = antonymsArray.join(';');
+          changed = true;
+        }
+        if (!synonymsArray.map(s => s.toLowerCase()).includes(feedbackLower)) {
+          synonymsArray.push(feedbackSourceHeader);
+          payload.Synonyms = synonymsArray.join(';');
+          changed = true;
+        }
+      } else { // isNegative (Antonym)
+        // Add to Antonyms, remove from Synonyms if present
+        if (synonymsArray.map(s => s.toLowerCase()).includes(feedbackLower)) {
+          synonymsArray = synonymsArray.filter(s => s.toLowerCase() !== feedbackLower);
+          payload.Synonyms = synonymsArray.join(';');
+          changed = true;
+        }
+        if (!antonymsArray.map(a => a.toLowerCase()).includes(feedbackLower)) {
+          antonymsArray.push(feedbackSourceHeader);
+          payload.Antonyms = antonymsArray.join(';');
+          changed = true;
+        }
+      }
+
+      if (changed) {
+            const headers = new HttpHeaders({ 'Accept': 'application/vnd.intergraph.data+json' });
+       headers.set('X-Ingr-TenantId', '1');  
+    headers.set('X-Ingr-OrgId', '5377fd8c-2461-40fa-bda2-f733d6936019'); 
+     console.log('headers', headers);
+        await this.http.patch(patchUrl, payload,{headers:headers}).toPromise();
+        this.updateStatus(`Feedback for "${feedbackSourceHeader}" on "${propertyName}" saved.`, false);
+        // Optionally update local cache of synonyms/antonyms for targetSchemaEntry
+        if (payload.Synonyms !== undefined) targetSchemaEntry.Synonyms = payload.Synonyms.split(';');
+        if (payload.Antonyms !== undefined) targetSchemaEntry.Antonyms = payload.Antonyms.split(';');
+      } else {
+        this.updateStatus(`Feedback for "${feedbackSourceHeader}" on "${propertyName}" already consistent.`, false);
+      }
+
+    } catch (error: any) {
+      console.error(`Error updating feedback for property "${propertyName}" (OBID: ${targetSchemaEntry.OBID}):`, error);
+      const errorMsg = error.error?.message || error.message || 'An unknown error occurred during feedback update.';
+      this.updateStatus(`Failed to save feedback for "${propertyName}": ${errorMsg}`, true);
+    }
+  }
+
 
   private applyAISuggestionVisuals(
     row: MappingTableRow,
@@ -417,12 +711,15 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
     this.suggestMappingsButtonDisabled = true;
     const originalButtonText = this.suggestButtonText;
 
-    const totalPhases = this.isTripletKnowledgeBaseUploaded ? 2 : 1;
+    // Triplet knowledge is now potentially available from OData even if isTripletKnowledgeBaseUploaded (by file) is false
+    const hasAnyTripletKnowledge = this.tripletKnowledgeBase.length > 0;
+
+    const totalPhases = hasAnyTripletKnowledge ? 2 : 1;
     let currentLogicalPhase = 0; // 0 for Triplet (if active), 1 for Header
 
     const updateSpinner = (phaseType: string) => {
       let displayPhase = currentLogicalPhase;
-      if (this.isTripletKnowledgeBaseUploaded) {
+      if (hasAnyTripletKnowledge) {
         displayPhase += 1; // User sees 1-indexed phases
       } else {
         // If only header phase, it's phase 1 of 1
@@ -443,22 +740,33 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
 
 
     // Phase 0: Triplet Knowledge Base
-    if (this.isTripletKnowledgeBaseUploaded) {
+    if (hasAnyTripletKnowledge) {
       currentLogicalPhase = 0; // Corresponds to "Phase 1" for user
       updateSpinner("Triplet Knowledge");
       this.mappingTableRows.forEach(row => {
         if (row.selectedTarget === "" || row.selectedTarget === this.N_A_MAP_VALUE) { // Only if not manually mapped or already N/A
-          const tripletEntry = this.tripletKnowledgeBase.find(entry => entry.anchor === row.sourceHeader);
-          if (tripletEntry && tripletEntry.positive) {
-            const suggestedTripletTarget = tripletEntry.positive;
-            if (suggestedTripletTarget === "N/A" || suggestedTripletTarget === this.N_A_MAP_VALUE) {
-              this.applyAISuggestionVisuals(row, 'triplet', this.N_A_MAP_VALUE);
-              // N/A doesn't consume a target slot.
-            } else if (this.targetSchemaColumns.includes(suggestedTripletTarget) && !alreadyUsedTargets.has(suggestedTripletTarget)) {
-              this.applyAISuggestionVisuals(row, 'triplet', suggestedTripletTarget);
-              alreadyUsedTargets.add(suggestedTripletTarget);
+          // Find triplet entries where the 'positive' (synonym) matches the current sourceHeader
+          const matchingTripletEntries = this.tripletKnowledgeBase.filter(
+            entry => entry.positive && entry.positive.toLowerCase() === row.sourceHeader.toLowerCase() && entry.anchor
+          );
+
+          for (const tripletEntry of matchingTripletEntries) {
+            const suggestedTargetAnchor = tripletEntry.anchor; // This is the target DisplayName
+
+            // Check if this anchor is a valid target column and hasn't been used yet
+            if (this.targetSchemaColumns.includes(suggestedTargetAnchor) && !alreadyUsedTargets.has(suggestedTargetAnchor)) {
+              this.applyAISuggestionVisuals(row, 'triplet', suggestedTargetAnchor);
+              alreadyUsedTargets.add(suggestedTargetAnchor);
+              break; // Found a valid suggestion for this row, move to the next row
+            }
+            // If the suggestedTargetAnchor is "N/A" (though unlikely for an anchor from synonyms), handle it.
+            // Or if N_A_MAP_VALUE is explicitly set as a positive, treat it.
+            else if (suggestedTargetAnchor === this.N_A_MAP_VALUE || tripletEntry.positive === this.N_A_MAP_VALUE) {
+                 this.applyAISuggestionVisuals(row, 'triplet', this.N_A_MAP_VALUE);
+                 break;
             }
           }
+          // Negatives are not directly used for suggestions here, but for training data generation for the AI model.
         }
       });
       currentLogicalPhase = 1; // Advance logical phase to Header
@@ -597,6 +905,7 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
     this.isSuggesting = false;
     this.suggestMappingsButtonDisabled = false;
     this.suggestButtonText = originalButtonText;
+    this.allowCreateNewProperty = true; // Enable create new property option
     this.checkAndHighlightDuplicateTargets();
     this.updateDownloadButtonsState();
     this.cdr.detectChanges();
@@ -611,49 +920,8 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
     return strData;
   }
 
-  handleDownloadTripletCsv(): void {
-    if (!this.isSourceUploaded) {
-      this.updateStatus('Source CSV not uploaded. Cannot generate triplet data.', true);
-      return;
-    }
-
-    const tripletData: string[][] = [];
-    const csvHeaders = ['anchor', 'positive', 'negative'];
-    tripletData.push(csvHeaders);
-
-    let aiSuggestionsFoundAndProcessed = false;
-
-    this.mappingTableRows.forEach(row => {
-      if (row.sourceHeader && row.aiSuggestedTargetValue) { // AI made a suggestion for this row
-        aiSuggestionsFoundAndProcessed = true;
-        const userFinalSelection = row.selectedTarget;
-        const anchor = row.sourceHeader;
-        let positive: string;
-        let negative: string;
-
-        if (userFinalSelection !== "" && userFinalSelection !== row.aiSuggestedTargetValue) {
-          positive = userFinalSelection;
-          negative = row.aiSuggestedTargetValue;
-        } else {
-          positive = row.aiSuggestedTargetValue;
-          negative = ""; // No differing choice to record as negative
-        }
-        tripletData.push([this.escapeCsvCell(anchor), this.escapeCsvCell(positive), this.escapeCsvCell(negative)]);
-      }
-    });
-
-    if (!aiSuggestionsFoundAndProcessed) {
-      this.updateStatus('No AI suggestions were recorded or processed to generate triplet data. Please run AI suggestions.', false);
-      return;
-    }
-    if (tripletData.length <= 1) {
-      this.updateStatus('No triplet data generated. This might happen if AI suggestions were not made or not interacted with.', false);
-      return;
-    }
-
-    this.downloadCsv(tripletData, "triplet_loss.csv");
-    this.updateStatus('Triplet Loss CSV downloaded.', false);
-  }
+  // handleDownloadTripletCsv(): void { // REMOVED
+  // }
 
  handleDownloadMappedDataCsv(): void {
     if (!this.isSourceUploaded || this.sourceCsvSampleData.length === 0) {
@@ -726,56 +994,112 @@ export class CsvMapperComponent implements OnInit, OnDestroy {
       standardCsvData.push(outputStandardRow);
 
       nonStandardTargetHeaders.forEach(nonStdHeader => {
-        const originalSourceHeader = mappedTargetToSource[nonStdHeader];
+        const originalSourceHeader = mappedTargetToSource[nonStdHeader]; // nonStdHeader is DisplayName
         if (originalSourceHeader) {
           const sourceHeaderIndex = this.sourceCsvHeaders.indexOf(originalSourceHeader);
           if (sourceHeaderIndex !== -1 && sourceRow[sourceHeaderIndex] !== undefined) {
             const propertyValue = this.escapeCsvCell(sourceRow[sourceHeaderIndex]);
             if (propertyValue !== "") {
-              invertedCsvData.push([lineItemIdValue, this.escapeCsvCell(nonStdHeader), propertyValue, ""]);
+              const targetSchemaEntry = this.targetSchemaData.find(tsd => tsd.DisplayName === nonStdHeader);
+              let propertyNameForCsv = nonStdHeader; // Default to DisplayName
+              if(!propertyNameForCsv.startsWith("BOM")) {
+              propertyNameForCsv = propertyNameForCsv.replace(/[^a-zA-Z0-9_]/g, ''); // Replace non-alphanumeric with underscore
+              propertyNameForCsv= "BOM"+ propertyNameForCsv; // Ensure it starts with "BOM"
+              }
+              if (targetSchemaEntry && targetSchemaEntry.UID && targetSchemaEntry.UID.trim() !== "") {
+                propertyNameForCsv = targetSchemaEntry.UID;
+              } else if (targetSchemaEntry) {
+                // Entry exists but UID is missing, empty, or whitespace
+                console.warn(`UID is missing or empty for DisplayName: '${nonStdHeader}'. Using DisplayName as fallback for Property_Name in inverted CSV.`);
+              } else {
+                // No entry found for this DisplayName at all (should be rare if mappings are correct)
+                console.warn(`No target schema entry found for DisplayName: '${nonStdHeader}'. Using DisplayName as fallback for Property_Name in inverted CSV.`);
+              }
+              invertedCsvData.push([lineItemIdValue, this.escapeCsvCell(propertyNameForCsv), propertyValue, ""]);
             }
           }
         }
       });
     });
 
-  let standardUploaded = false;
-    let invertedUploaded = false;
+
     let statusMessages: string[] = [];
 
-    const uploadFile = (fileData: string[][], filename: string) => {
+   const createFileObject = (fileData: string[][], filename: string): File | null => {
+      if (fileData.length <= 1) { // Only headers or empty
+        statusMessages.push(`${filename} had no data to upload.`);
+        return null;
+      }
       const csvContent = fileData.map(row => row.join(',')).join('\r\n');
       const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-      const file = new File([blob], filename, { type: 'text/csv;charset=utf-8;' });
-      this.updateStatus(`Uploading ${filename}...`, false);
-      this.loaderService.runFullWorkflow(file).subscribe({
-        next: () => {
-          statusMessages.push(`${filename} uploaded successfully.`);
-          if (filename === "standard_mapped_data.csv") standardUploaded = true;
-          if (filename === "inverted_mapped_data.csv") invertedUploaded = true;
-          this.updateStatus(statusMessages.join(' '), false);
-        },
-        error: (err) => {
-          console.error(`Error uploading ${filename}:`, err);
-          statusMessages.push(`Error uploading ${filename}. Check console.`);
-          this.updateStatus(statusMessages.join(' '), true);
-          
-        }
-      });
+       return new File([blob], filename, { type: 'text/csv;charset=utf-8;' });
     };
-console.log(standardUploaded, invertedUploaded);
-    if (standardCsvData.length > 1) {
-      uploadFile(standardCsvData, "standard_mapped_data.csv");
-    } else {
-      statusMessages.push("Standard CSV had no data to upload.");
-    }
+  
+     const standardFile = createFileObject(standardCsvData, "standard_mapped_data.csv");
+    const invertedFile = createFileObject(invertedCsvData, "inverted_mapped_data.csv");
 
-    if (invertedCsvData.length > 1) {
-      uploadFile(invertedCsvData, "inverted_mapped_data.csv");
+    const uploadStandard = () => {
+      if (standardFile) {
+        this.updateStatus(`Uploading ${standardFile.name}...`, false);
+        this.loaderService.runFullWorkflow(standardFile).subscribe({
+          next: () => {
+            statusMessages.push(`${standardFile.name} uploaded successfully.`);
+            this.updateStatus(statusMessages.join(' '), false);
+            uploadInverted(); // Proceed to inverted upload
+          },
+          error: (err) => {
+            console.error(`Error uploading ${standardFile.name}:`, err);
+            statusMessages.push(`Error uploading ${standardFile.name}. Check console. Inverted file will not be uploaded.`);
+            this.updateStatus(statusMessages.join(' '), true);
+            // Do not proceed to upload inverted file
+            finalizeUploadProcess();
+          }
+        });
+      } else {
+        // If standard file is null (no data), attempt to upload inverted if it exists
+        setTimeout(() => {
+             uploadInverted();
+        }, 180000);
+     
+      }
+    };
+     const uploadInverted = () => {
+      if (invertedFile) {
+        this.updateStatus(`Uploading ${invertedFile.name}...`, false);
+        this.loaderService.runFullWorkflow(invertedFile).subscribe({
+          next: () => {
+            statusMessages.push(`${invertedFile.name} uploaded successfully.`);
+            this.updateStatus(statusMessages.join(' '), false);
+            finalizeUploadProcess();
+          },
+          error: (err) => {
+            console.error(`Error uploading ${invertedFile.name}:`, err);
+            statusMessages.push(`Error uploading ${invertedFile.name}. Check console.`);
+            this.updateStatus(statusMessages.join(' '), true);
+            finalizeUploadProcess();
+          }
+        });
+      } else {
+        finalizeUploadProcess();
+      }
+    };
+     const finalizeUploadProcess = () => {
+        if (lineItemIdSourceHeader === undefined && (standardFile || invertedFile)) {
+            statusMessages.push("Note: 'Line Item ID' was not mapped; it will be blank in the Inverted CSV if it was uploaded.");
+        }
+        if (statusMessages.length > 0) {
+            const isError = statusMessages.some(msg => msg.toLowerCase().includes("error"));
+            this.updateStatus(statusMessages.join(' '), isError);
+        } else if (!standardFile && !invertedFile) {
+             this.updateStatus('No data to upload for Standard or Inverted CSVs based on current mappings.', false);
+        }
+    };
+  if (standardFile || invertedFile) {
+        uploadStandard();
     } else {
-      statusMessages.push("Inverted CSV had no data to upload.");
+        // Neither file had data
+        finalizeUploadProcess();
     }
-    
     if (lineItemIdSourceHeader === undefined) {
         statusMessages.push("Note: 'Line Item ID' was not mapped; it will be blank in the Inverted CSV.");
     }
@@ -786,21 +1110,22 @@ console.log(standardUploaded, invertedUploaded);
         this.updateStatus('No data to upload for Standard or Inverted CSVs based on current mappings.', false);
     }
   }
+  
 
-  private downloadCsv(data: string[][], filename: string): void {
-    const csvContent = data.map(row => row.join(',')).join('\r\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement("a");
-    if (link.download !== undefined) {
-      const url = URL.createObjectURL(blob);
-      link.setAttribute("href", url);
-      link.setAttribute("download", filename);
-      link.style.visibility = 'hidden';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-    } else {
-      this.updateStatus('CSV download not supported by your browser.', true);
-    }
-  }
+  //private downloadCsv(data: string[][], filename: string): void {
+  //  const csvContent = data.map(row => row.join(',')).join('\r\n');
+  //  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  //  const link = document.createElement("a");
+  //  if (link.download !== undefined) {
+  //    const url = URL.createObjectURL(blob);
+  //    link.setAttribute("href", url);
+  //    link.setAttribute("download", filename);
+  //    link.style.visibility = 'hidden';
+  //    document.body.appendChild(link);
+  //    link.click();
+  //    document.body.removeChild(link);
+  //  } else {
+  //    this.updateStatus('CSV download not supported by your browser.', true);
+  //  }
+  //}
 }
